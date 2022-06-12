@@ -3,6 +3,9 @@ use hyper::{Body, Request, Response, Server};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
+mod output;
+mod process;
+
 struct IgnoreError;
 
 impl From<std::io::Error> for IgnoreError {
