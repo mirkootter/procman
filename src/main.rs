@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 mod output;
 mod process;
+mod watch;
 
 struct IgnoreError;
 
@@ -18,27 +19,6 @@ impl From<hyper::Error> for IgnoreError {
     fn from(_: hyper::Error) -> IgnoreError {
         IgnoreError
     }
-}
-
-#[cfg(windows)]
-fn shell_execute(cmd: &'_ str) -> std::io::Result<tokio::process::Child> {
-    tokio::process::Command::new("cmd.exe")
-        .arg("/c")
-        .arg(cmd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-}
-
-#[cfg(unix)]
-fn shell_execute(cmd: &'_ str) -> std::io::Result<tokio::process::Child> {
-    tokio::process::Command::new("sh")
-        .arg(cmd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
 }
 
 fn make_error_response(status: hyper::StatusCode) -> Result<Response<Body>, Infallible> {
@@ -64,44 +44,31 @@ async fn handle_shell(req: Request<Body>) -> Result<Response<Body>, Infallible> 
         Some(cmd) => cmd,
     };
 
-    let mut child = match shell_execute(cmd) {
-        Err(_) => return make_error_response(hyper::StatusCode::EXPECTATION_FAILED),
-        Ok(child) => child,
-    };
+    let process = process::Process::new(cmd.to_owned());
+    tokio::spawn(process.run());
 
     {
         let (mut sender, body) = Body::channel();
+        let mut watcher = process.watch();
         tokio::spawn(async move {
-            if let Some(stdout) = &mut child.stdout {
-                use tokio::io::AsyncReadExt;
-
-                let mut buf = [0u8; 1024];
-                loop {
-                    let bytes_read = stdout.read(&mut buf).await?;
-                    if bytes_read == 0 {
+            loop {
+                match watcher.read().await {
+                    process::WatchResult::Exited(Some(exit_code)) => {
+                        let message = format!("\n\nExited with exit code {}", exit_code);
+                        sender.send_data(hyper::body::Bytes::from(message)).await?;
                         break;
                     }
-
-                    sender
-                        .send_data(hyper::body::Bytes::copy_from_slice(&buf[..bytes_read]))
-                        .await?;
-                }
-            }
-
-            let exit_code = match child.wait().await {
-                Err(_) => None,
-                Ok(exit_status) => exit_status.code(),
-            };
-
-            match exit_code {
-                None => {
-                    sender
-                        .send_data(hyper::body::Bytes::from_static(b"\n\nSomething went wrong"))
-                        .await?;
-                }
-                Some(exit_code) => {
-                    let message = format!("\n\nExited with exit code {}", exit_code);
-                    sender.send_data(hyper::body::Bytes::from(message)).await?;
+                    process::WatchResult::Exited(None) => {
+                        sender
+                            .send_data(hyper::body::Bytes::from_static(
+                                b"\n\nProcess exited without exit code",
+                            ))
+                            .await?;
+                        break;
+                    }
+                    process::WatchResult::OutputChunk(chunk) => {
+                        sender.send_data(hyper::body::Bytes::from(chunk)).await?;
+                    }
                 }
             }
 
@@ -109,7 +76,7 @@ async fn handle_shell(req: Request<Body>) -> Result<Response<Body>, Infallible> 
         });
 
         let response = Response::builder()
-            .header("Content-Type", "text/event-stream")
+            .header("Content-Type", "text/event-stream; charset=utf-8")
             .status(hyper::http::StatusCode::OK)
             .body(body)
             .unwrap();
