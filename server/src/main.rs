@@ -29,6 +29,71 @@ fn make_error_response(status: hyper::StatusCode) -> Result<Response<Body>, Infa
     Ok(response)
 }
 
+mod server {
+    use super::{IgnoreError, process};
+
+    #[derive(Clone, Copy, Eq, PartialEq, Hash)]
+    pub struct ProcessID(u64);
+    
+    #[derive(Default)]
+    pub struct Server {
+        processes: std::collections::HashMap<ProcessID, process::Process>,
+        counter: std::sync::atomic::AtomicU64
+    }
+
+    impl Server {
+        fn alloc_pid(&mut self) -> ProcessID {
+            let counter = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            ProcessID(counter)
+        }
+
+        fn spawn_shell(&mut self, cmd: String, mut response: hyper::body::Sender) {
+            let pid = self.alloc_pid();
+            let process = process::Process::new(cmd);
+            tokio::spawn(process.run());
+
+            let mut watcher = process.watch();
+            self.processes.insert(pid, process);
+
+            tokio::spawn(async move {
+                loop {
+                    match watcher.read().await {
+                        process::WatchResult::Exited(Some(exit_code)) => {
+                            let message = format!("\n\nExited with exit code {}", exit_code);
+                            response.send_data(hyper::body::Bytes::from(message)).await?;
+                            break;
+                        }
+                        process::WatchResult::Exited(None) => {
+                            response
+                                .send_data(hyper::body::Bytes::from_static(
+                                    b"\n\nProcess exited without exit code",
+                                ))
+                                .await?;
+                            break;
+                        }
+                        process::WatchResult::OutputChunk(chunk) => {
+                            response.send_data(hyper::body::Bytes::from(chunk)).await?;
+                        }
+                    }
+                }
+    
+                Ok::<(), IgnoreError>(())
+            });
+        }
+    }
+
+    impl Server {
+        pub async fn global_spawn_shell(cmd: String, response: hyper::body::Sender) {
+            let mut server = GLOBAL_SERVER.lock().await;
+            server.spawn_shell(cmd, response)
+        }
+    }
+
+    lazy_static::lazy_static! {
+        static ref GLOBAL_SERVER: tokio::sync::Mutex<Server> = tokio::sync::Mutex::new(Server::default());
+    }
+}
+
 async fn handle_shell(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     let query = match req.uri().query() {
         None => return make_error_response(hyper::StatusCode::BAD_REQUEST),
@@ -44,36 +109,9 @@ async fn handle_shell(req: Request<Body>) -> Result<Response<Body>, Infallible> 
         Some(cmd) => cmd,
     };
 
-    let process = process::Process::new(cmd.to_owned());
-    tokio::spawn(process.run());
-
     {
-        let (mut sender, body) = Body::channel();
-        let mut watcher = process.watch();
-        tokio::spawn(async move {
-            loop {
-                match watcher.read().await {
-                    process::WatchResult::Exited(Some(exit_code)) => {
-                        let message = format!("\n\nExited with exit code {}", exit_code);
-                        sender.send_data(hyper::body::Bytes::from(message)).await?;
-                        break;
-                    }
-                    process::WatchResult::Exited(None) => {
-                        sender
-                            .send_data(hyper::body::Bytes::from_static(
-                                b"\n\nProcess exited without exit code",
-                            ))
-                            .await?;
-                        break;
-                    }
-                    process::WatchResult::OutputChunk(chunk) => {
-                        sender.send_data(hyper::body::Bytes::from(chunk)).await?;
-                    }
-                }
-            }
-
-            Ok::<(), IgnoreError>(())
-        });
+        let (sender, body) = Body::channel();
+        server::Server::global_spawn_shell(cmd.to_owned(), sender).await;
 
         let response = Response::builder()
             .header("Content-Type", "text/event-stream; charset=utf-8")

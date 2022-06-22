@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 hyper = { version = "0.14.19", features = ["server", "http1", "tcp"] }
+lazy_static = "1.4.0"
 tokio = { version = "1.19.2", features = ["full"] }
 url = "2.2.2"

@@ -148,6 +148,7 @@ fn shell_execute(cmd: &'_ str) -> std::io::Result<tokio::process::Child> {
 #[cfg(unix)]
 fn shell_execute(cmd: &'_ str) -> std::io::Result<tokio::process::Child> {
     tokio::process::Command::new("sh")
+        .arg("-c")
         .arg(cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
